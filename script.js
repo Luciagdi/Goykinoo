@@ -264,18 +264,26 @@ async function submitModEpisodeRequest() {
     if (!m) return;
 
     let newRequest = {
-        id: Date.now(), type: 'EPISODE_ADD',
+        type: 'EPISODE_ADD',
         movieId, movieTitle: m.title, movieCode: m.code,
         epNum, epTitle: epTitle || `${epNum}-р анги`, videoUrl,
         senderName: currentUser.name, senderId: currentUser.id,
         status: 'pending', createdAt: new Date().toISOString()
     };
-    requests.push(newRequest);
-    saveData();
-    updateRequestBadge();
 
-    const { error } = await supabaseClient.from('requests').insert({ ...newRequest });
-    if (error) console.error('Supabase request insert алдаа:', error);
+    // DB-д эхлээд insert хийж жинхэнэ ID авна — local Date.now() ID ашиглахгүй
+    const { data: inserted, error } = await supabaseClient
+        .from('requests').insert({ ...newRequest }).select().single();
+    if (error) {
+        console.error('Supabase request insert алдаа:', error);
+        newRequest.id = Date.now(); // fallback
+    } else if (inserted) {
+        newRequest.id = inserted.id;
+    }
+
+    requests.push(newRequest);
+    updateLocalState();
+    updateRequestBadge();
 
     document.getElementById('modEpNumber').value = '';
     document.getElementById('modEpTitle').value = '';
@@ -299,16 +307,24 @@ async function submitModRequest() {
         return showToast('Энэ код аль хэдийн бүртгэлтэй байна!', 'error');
 
     let newRequest = {
-        id: Date.now(), type: 'MOVIE_ADD',
+        type: 'MOVIE_ADD',
         title, code, desc, category, movieStatus, price,
         senderName: currentUser.name, senderId: currentUser.id,
         status: 'pending', createdAt: new Date().toISOString()
     };
+
+    // DB-д эхлээд insert хийж жинхэнэ ID авна — local Date.now() ID ашиглахгүй
+    const { data: inserted, error } = await supabaseClient
+        .from('requests').insert({ ...newRequest }).select().single();
+    if (error) {
+        console.error('Supabase request insert алдаа:', error);
+        newRequest.id = Date.now(); // fallback
+    } else if (inserted) {
+        newRequest.id = inserted.id;
+    }
+
     requests.push(newRequest);
     updateRequestBadge();
-
-    const { error } = await supabaseClient.from('requests').insert({ ...newRequest });
-    if (error) console.error('Supabase request insert алдаа:', error);
 
     ['modReqTitle','modReqCode','modReqDesc'].forEach(id => {
         let el = document.getElementById(id); if (el) el.value = '';
@@ -341,7 +357,9 @@ async function verifyIsAdminOrMod() {
     return true;
 }
 
-function saveData() {
+// ЗАСАЛ 5: saveData → updateLocalState гэж нэрлэж, хийдэг зүйлээ тодорхой болголоо
+// Supabase-д юу ч бичдэггүй — зөвхөн local array болон sessionStorage шинэчилнэ
+function updateLocalState() {
     if (currentUser) {
         let idx = users.findIndex(u => u.id === currentUser.id);
         if (idx !== -1) users[idx] = currentUser;
@@ -512,7 +530,7 @@ async function registerLogic() {
 
     users.push(newUser);
     currentUser = newUser;
-    saveData();
+    updateLocalState();
     hideLoading();
     closeModal('loginModal');
     checkAuthUI();
@@ -557,7 +575,8 @@ function showToast(message, type = 'success') {
         box-shadow:0 4px 20px rgba(0,0,0,0.3);
         animation:slideIn 0.3s ease;
     `;
-    toast.innerHTML = `<i class="fas fa-${type === 'error' ? 'times-circle' : 'check-circle'}"></i> ${message}`;
+    // escapeHtml — message нь хэрэглэгчийн нэр зэрэг гадны өгөгдөл агуулж болно
+    toast.innerHTML = `<i class="fas fa-${type === 'error' ? 'times-circle' : 'check-circle'}"></i> ${escapeHtml(message)}`;
     document.body.appendChild(toast);
 
     let style = document.createElement('style');
@@ -681,6 +700,15 @@ async function showMovieProfile(id) {
     if (!m) return;
     currentSelectedMovieId = id;
 
+    // Ангиудыг lazy load — эхний жагсаалтад орохгүй байсан тул одоо татна
+    if (!m.episodes) {
+        showLoading('Кино мэдээлэл татаж байна...');
+        const { data: fullMovie } = await supabaseClient
+            .from('movies').select('episodes').eq('id', id).single();
+        if (fullMovie) m.episodes = fullMovie.episodes || [];
+        hideLoading();
+    }
+
     // ЗАСАЛ 2: Atomic increment — race condition байхгүй
     supabaseClient.rpc('increment_views', { movie_id: id }).then(({ error }) => {
         if (error) {
@@ -696,8 +724,13 @@ async function showMovieProfile(id) {
         currentUser.history = currentUser.history.filter(hid => hid !== id);
         currentUser.history.unshift(id);
         if (currentUser.history.length > 8) currentUser.history = currentUser.history.slice(0, 8);
+        // ЗАСАЛ 5: Үзсэн түүхийг Supabase-д хадгална — өөр төхөөрөмжид ч харагдана
+        supabaseClient.from('profile')
+            .update({ history: currentUser.history })
+            .eq('id', currentUser.id)
+            .then(({ error }) => { if (error) console.error('History update алдаа:', error); });
     }
-    saveData();
+    updateLocalState();
 
     document.getElementById('mProfType').innerText    = m.category === 'drama' ? 'ЦУВРАЛ КИНО' : 'ВЭБТУН / КОМИК';
     document.getElementById('mProfTitle').innerText   = m.title;
@@ -744,10 +777,18 @@ function renderMovieActionButtons(m) {
         if (epBlock) epBlock.classList.remove('hidden');
         renderEpisodesList(m.episodes);
     } else {
+        // data-attribute ашиглан onclick-д шууд утга оруулахгүй (injection хамгаалалт)
         container.innerHTML = `
             <button class="btn-vip" onclick="showPage('vipPage')"><i class="fas fa-crown"></i> VIP авах</button>
-            <button class="btn-main" onclick="rentMovieDirect('${m.code}', ${m.price})"><i class="fas fa-key"></i> Түрээслэх (${m.price.toLocaleString()} ₮)</button>
+            <button class="btn-main" id="rentBtn"
+                data-code="${escapeHtml(m.code)}"
+                data-price="${m.price}">
+                <i class="fas fa-key"></i> Түрээслэх (${m.price.toLocaleString()} ₮)
+            </button>
         `;
+        document.getElementById('rentBtn').addEventListener('click', function() {
+            rentMovieDirect(this.dataset.code, parseInt(this.dataset.price));
+        });
         if (epBlock) epBlock.classList.add('hidden');
     }
 }
@@ -849,7 +890,7 @@ function playEpisode(num, file, title) {
         }
 
         if (nowPlaying) {
-            nowPlaying.innerHTML = `<i class="fas fa-play-circle"></i> Анги ${num}${title ? ' - ' + title : ''} тоглуулж байна...`;
+            nowPlaying.innerHTML = `<i class="fas fa-play-circle"></i> Анги ${num}${title ? ' - ' + escapeHtml(title) : ''} тоглуулж байна...`;
         }
 
         document.querySelectorAll('.ep-btn').forEach(btn => btn.classList.remove('active-ep'));
@@ -924,18 +965,26 @@ function copyText(elementId) {
 
 async function confirmPaymentSubmit() {
     let newRequest = {
-        id: Date.now(), type: 'PAYMENT',
+        type: 'PAYMENT',
         paymentType: activePaymentType, code: pendingCode,
         amount: pendingAmount, userId: currentUser.id,
         userEmail: currentUser.email, userName: currentUser.name,
         userPhone: currentUser.phone,
         status: 'pending', createdAt: new Date().toISOString()
     };
-    requests.push(newRequest);
-    saveData();
 
-    const { error } = await supabaseClient.from('requests').insert({ ...newRequest });
-    if (error) console.error('Supabase request insert алдаа:', error);
+    // ЗАСАЛ 3: Эхлээд Supabase-д insert хийж жинхэнэ ID авна — Date.now() fallback болгон л үлдэнэ
+    const { data: inserted, error } = await supabaseClient
+        .from('requests').insert({ ...newRequest }).select().single();
+    if (error) {
+        console.error('Supabase request insert алдаа:', error);
+        newRequest.id = Date.now(); // fallback
+    } else if (inserted) {
+        newRequest.id = inserted.id;
+    }
+
+    requests.push(newRequest);
+    updateLocalState();
 
     closeModal('paymentModal');
     updateRequestBadge();
@@ -1005,7 +1054,7 @@ async function saveUserProfileChanges() {
     currentUser.name  = newName;
     currentUser.phone = newPhone;
     if (tempSelectedAvatarUrl) currentUser.avatar = tempSelectedAvatarUrl;
-    saveData();
+    updateLocalState();
 
     const { error } = await supabaseClient
         .from('profile')
@@ -1068,7 +1117,7 @@ async function recoverPasswordLogic() {
     document.getElementById('forgotStep1').classList.add('hidden');
     document.getElementById('forgotStep2').classList.remove('hidden');
     let otpEmailEl = document.getElementById('otpTargetEmail');
-    if (otpEmailEl) otpEmailEl.innerText = email;
+    if (otpEmailEl) otpEmailEl.textContent = email; // textContent — HTML injection хамгаалалт
     showToast('Нууц үг сэргээх линк таны имэйл рүү илгээгдлээ!');
 }
 
@@ -1512,7 +1561,7 @@ async function adminAddEpisodeToMovie() {
 
     m.episodes.push({ num, title: epTitle, file: tempSelectedVideoFile, thumb: tempSelectedEpThumb });
     m.episodes.sort((a, b) => a.num - b.num);
-    saveData();
+    updateLocalState();
 
     const { error } = await supabaseClient
         .from('movies').update({ episodes: m.episodes }).eq('id', adminSelectedSeriesId);
@@ -1579,7 +1628,7 @@ async function adminSaveMovie() {
         showToast('Шинэ кино амжилттай нэмэгдлээ!');
     }
 
-    saveData();
+    updateLocalState();
     ['admTitle', 'admDesc', 'admManualCode'].forEach(id => {
         let el = document.getElementById(id); if (el) el.value = '';
     });
@@ -1685,7 +1734,7 @@ async function adminDeleteMovie(id) {
                 let display = document.getElementById('admSelectedSeriesDisplay');
                 if (display) display.innerText = 'Кино сонгогдоогүй байна.';
             }
-            saveData();
+            updateLocalState();
             const { error } = await supabaseClient.from('movies').delete().eq('id', id);
             if (error) console.error('Supabase movie delete алдаа:', error);
             renderAdminMovieList();
@@ -1734,13 +1783,13 @@ async function renderAdminUsersTable(page = 0) {
         let actionButtons = u.role !== 'admin' ? `
             <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
                 ${u.role === 'moderator'
-                    ? `<button onclick="changeUserRole('${u.email}','user')" style="background:#d97706;color:#fff;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;">Mod цуцлах</button>`
-                    : `<button onclick="changeUserRole('${u.email}','moderator')" style="background:#3b82f6;color:#fff;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;">Mod болгох</button>`
+                    ? `<button onclick="changeUserRole(${JSON.stringify(u.email)},'user')" style="background:#d97706;color:#fff;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;">Mod цуцлах</button>`
+                    : `<button onclick="changeUserRole(${JSON.stringify(u.email)},'moderator')" style="background:#3b82f6;color:#fff;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;">Mod болгох</button>`
                 }
                 <input type="number" id="vipDays-${idx}" placeholder="Хоног"
                     style="width:60px;padding:4px;font-size:11px;background:#0f172a;border:1px solid #334155;color:#fff;border-radius:4px;">
-                <button onclick="adminGiveVipDays('${u.email}',${idx})" style="background:#10b981;color:#fff;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;">VIP өгөх</button>
-                <button onclick="adminApprovePayment('${u.email}')" style="background:#8b5cf6;color:#fff;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;">Түрээс нээх</button>
+                <button onclick="adminGiveVipDays(${JSON.stringify(u.email)},${idx})" style="background:#10b981;color:#fff;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;">VIP өгөх</button>
+                <button onclick="adminApprovePayment(${JSON.stringify(u.email)})" style="background:#8b5cf6;color:#fff;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;">Түрээс нээх</button>
             </div>
         ` : `<span style="color:var(--vip-color);font-weight:600;">Үндсэн Админ</span>`;
 
@@ -1792,7 +1841,7 @@ async function adminGiveVipDays(userEmail, idx) {
     let currentMs = u.vipExpires ? Number(new Date(u.vipExpires)) : 0;
     let base      = currentMs > Date.now() ? currentMs : Date.now();
     u.vipExpires  = base + days * 24 * 60 * 60 * 1000;
-    saveData();
+    updateLocalState();
 
     const { error } = await supabaseClient
         .from('profile').update({ vipExpires: u.vipExpires }).eq('email', userEmail);
@@ -1807,42 +1856,70 @@ async function adminGiveVipDays(userEmail, idx) {
 }
 
 async function adminApprovePayment(userEmail) {
-    let u = users.find(us => us.email === userEmail);
-    if (!u) return;
-    let pendingPayments = requests.filter(r => r.userEmail === userEmail && r.type === 'PAYMENT' && r.status === 'pending');
-    if (pendingPayments.length === 0)
+    if (!await verifyIsAdmin()) return;
+
+    // 1️⃣ DB-аас шинэ pending хүсэлтүүдийг татна (local state-д найдахгүй)
+    const { data: freshReqs, error: fetchErr } = await supabaseClient
+        .from('requests')
+        .select('*')
+        .eq('userEmail', userEmail)
+        .eq('type', 'PAYMENT')
+        .eq('status', 'pending');
+
+    if (fetchErr || !freshReqs || freshReqs.length === 0)
         return showToast('Энэ хэрэглэгчид хүлээгдэж байгаа төлбөрийн хүсэлт байхгүй байна.', 'error');
 
-    for (const r of pendingPayments) {
+    // 2️⃣ Хэрэглэгчийн шинэ өгөгдлийг DB-аас татна
+    const { data: freshUser, error: userErr } = await supabaseClient
+        .from('profile').select('*').eq('email', userEmail).single();
+    if (userErr || !freshUser) return showToast('Хэрэглэгч олдсонгүй!', 'error');
+
+    let approvedCount = 0;
+    for (const r of freshReqs) {
+        // 3️⃣ Тус бүрд lock хийнэ — 2 admin зэрэг дарвал зөвхөн нэг нь амжина
+        const { error: lockErr } = await supabaseClient
+            .from('requests').update({ status: 'approved' })
+            .eq('id', r.id).eq('status', 'pending');
+        if (lockErr) continue; // Аль хэдийн өөр admin батласан
+
         if (r.paymentType === 'VIP') {
-            let vipDays   = getVipDays(r.code);
-            let currentMs = u.vipExpires ? Number(new Date(u.vipExpires)) : 0;
+            let days      = getVipDays(r.code);
+            let currentMs = freshUser.vipExpires ? Number(new Date(freshUser.vipExpires)) : 0;
             let base      = currentMs > Date.now() ? currentMs : Date.now();
-            u.vipExpires  = base + vipDays * 24 * 60 * 60 * 1000;
-            emailVipApproved(u, r.code, new Date(u.vipExpires).toLocaleDateString('mn-MN'));
+            freshUser.vipExpires = base + days * 24 * 60 * 60 * 1000;
+            await supabaseClient.from('profile')
+                .update({ vipExpires: freshUser.vipExpires }).eq('id', freshUser.id);
+            emailVipApproved(freshUser, r.code, new Date(freshUser.vipExpires).toLocaleDateString('mn-MN'));
         } else if (r.paymentType === 'RENT') {
-            if (!u.rentedMovies) u.rentedMovies = [];
-            if (!u.rentedMovies.includes(r.code)) {
-                u.rentedMovies.push(r.code);
+            let rentedMovies = freshUser.rentedMovies || [];
+            if (!rentedMovies.includes(r.code)) {
+                rentedMovies.push(r.code);
+                freshUser.rentedMovies = rentedMovies;
+                await supabaseClient.from('profile')
+                    .update({ rentedMovies }).eq('id', freshUser.id);
                 let movie = movies.find(m => m.code === r.code);
-                if (movie) emailRentApproved(u, movie.title);
+                if (movie) emailRentApproved(freshUser, movie.title);
             }
         }
-        r.status = 'approved';
+
+        // Local state шинэчилнэ
+        let localReq = requests.find(req => req.id === r.id);
+        if (localReq) localReq.status = 'approved';
+        approvedCount++;
     }
-    saveData();
 
-    const { error: profileErr } = await supabaseClient
-        .from('profile').update({ vipExpires: u.vipExpires, rentedMovies: u.rentedMovies }).eq('id', u.id);
-    if (profileErr) console.error('Supabase profile update алдаа:', profileErr);
-
-    const reqIds = pendingPayments.map(r => r.id);
-    const { error: reqErr } = await supabaseClient
-        .from('requests').update({ status: 'approved' }).in('id', reqIds);
-    if (reqErr) console.error('Supabase requests update алдаа:', reqErr);
+    // Local user шинэчилнэ
+    let localUser = users.find(us => us.id === freshUser.id);
+    if (localUser) {
+        localUser.vipExpires   = freshUser.vipExpires;
+        localUser.rentedMovies = freshUser.rentedMovies;
+    }
 
     renderAdminUsersTable();
-    showToast(`${u.name} хэрэглэгчийн ${pendingPayments.length} хүсэлт баталгаажлаа!`);
+    updateRequestBadge();
+    showToast(approvedCount > 0
+        ? `${freshUser.name} хэрэглэгчийн ${approvedCount} хүсэлт баталгаажлаа!`
+        : 'Хүсэлтүүд аль хэдийн баталгаажсан байна.');
 }
 
 async function changeUserRole(userEmail, newRole) {
@@ -1850,7 +1927,7 @@ async function changeUserRole(userEmail, newRole) {
     let u = users.find(us => us.email === userEmail);
     if (!u) return;
     u.role = newRole;
-    saveData();
+    updateLocalState();
 
     const { error } = await supabaseClient
         .from('profile').update({ role: newRole }).eq('email', userEmail);
@@ -2072,14 +2149,18 @@ async function approveEpisodeRequest(reqId) {
     showToast(`${freshMovie.title} кинонд Анги ${freshReq.epNum} нэмэгдлээ!`);
 }
 
-function adminDeleteEpisode(movieId, epNum) {
+async function adminDeleteEpisode(movieId, epNum) {
+    // ЗАСАЛ 6: verifyIsAdmin() confirm dialog харуулахаас ӨМНӨ шалгана
+    // Өмнө нь: confirm → "Тийм" → шалгалт (хоцрогдсон)
+    // Одоо:    шалгалт → confirm → "Тийм" → устгах (зөв дараалал)
+    if (!await verifyIsAdmin()) return;
     showConfirm(
         `Анги ${epNum}-г устгахдаа итгэлтэй байна уу?`,
         async () => {
             let m = movies.find(mv => mv.id === movieId);
             if (!m) return;
             m.episodes = m.episodes.filter(e => e.num !== epNum);
-            saveData();
+            updateLocalState();
 
             const { error } = await supabaseClient
                 .from('movies').update({ episodes: m.episodes }).eq('id', movieId);
@@ -2098,7 +2179,7 @@ async function rejectRequest(reqId) {
     let r = requests.find(req => req.id === reqId);
     if (!r) return;
     r.status = 'rejected';
-    saveData();
+    updateLocalState();
 
     const { error } = await supabaseClient
         .from('requests').update({ status: 'rejected' }).eq('id', reqId);
@@ -2116,12 +2197,16 @@ function updateRequestBadge() {
 
 // ===== SUPABASE ӨГӨГДӨЛ АЧААЛЛАХ =====
 async function loadInitialDataFromSupabase() {
-    // ЗАСАЛ 1+3: Бүх хэрэглэгч татахгүй, кино 50-аар хязгаарлах (pagination)
+    // ЗАСАЛ 1+3: Бүх хэрэглэгч татахгүй, кино 100-аар хязгаарлах (pagination)
+    // episodes-ийг эхэнд татахгүй — кино нээхэд л татна (lazy load)
     const { data: moviesData, error: moviesErr } = await supabaseClient
-        .from('movies').select('*').order('id', { ascending: false }).limit(50);
+        .from('movies')
+        .select('id, title, desc, code, category, status, cover, price, views, isTrending, isNew')
+        .order('id', { ascending: false })
+        .limit(100);
     if (!moviesErr && Array.isArray(moviesData) && moviesData.length > 0) {
         movies = moviesData;
-        hasMoreMovies = moviesData.length === 50; // 50-аас цөөн ирвэл дараагийн хуудас байхгүй
+        hasMoreMovies = moviesData.length === 100; // 100-аас цөөн ирвэл дараагийн хуудас байхгүй
         moviesPage = 0;
     }
 
@@ -2140,8 +2225,9 @@ async function loadInitialDataFromSupabase() {
         .from('requests').select('*').eq('status', 'pending');
     if (!reqErr && Array.isArray(reqData)) requests = reqData;
 
+    // ЗАСАЛ 4: renderAllMoviesPage() энд дуудахгүй — showPage('allMoviesPage') дуудахад л render хийнэ
+    // Давхар render гарахаас сэргийлнэ
     renderHomeMovies();
-    renderAllMoviesPage();
     updateRequestBadge();
 }
 
@@ -2153,13 +2239,14 @@ async function loadMoreMovies() {
     if (!hasMoreMovies) return;
     moviesPage++;
     const { data, error } = await supabaseClient
-        .from('movies').select('*')
+        .from('movies')
+        .select('id, title, desc, code, category, status, cover, price, views, isTrending, isNew')
         .order('id', { ascending: false })
-        .range(moviesPage * 50, moviesPage * 50 + 49);
+        .range(moviesPage * 100, moviesPage * 100 + 99);
     if (!error && Array.isArray(data)) {
         if (data.length > 0) movies = [...movies, ...data];
-        // 50-аас цөөн ирвэл дараагийн хуудас байхгүй
-        if (data.length < 50) hasMoreMovies = false;
+        // 100-аас цөөн ирвэл дараагийн хуудас байхгүй
+        if (data.length < 100) hasMoreMovies = false;
         renderAllMoviesPage();
         renderHomeMovies();
     }
